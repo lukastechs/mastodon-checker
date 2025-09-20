@@ -5,6 +5,7 @@ require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 3000;
+const defaultInstance = process.env.DEFAULT_INSTANCE || 'mastodon.social';
 
 app.use(cors());
 app.use(express.json());
@@ -28,22 +29,19 @@ function calculateAgeDays(createdAt) {
   return Math.floor(diffMs / (1000 * 60 * 60 * 24));
 }
 
-// Fetch Mastodon user profile by handle (username@instance)
+// Fetch Mastodon user profile by handle (username or username@instance)
 async function getMastodonProfile(handle) {
   try {
-    // Default to popular instance if no @domain
-    if (!handle.includes('@')) {
-      handle = `${handle}@mastodon.social`;
-    }
-
-    const [username, instance] = handle.split('@');
+    // If no @instance, append default instance (e.g., mastodon.social)
+    let fullHandle = handle.includes('@') ? handle : `${handle}@${defaultInstance}`;
+    const [username, instance] = fullHandle.split('@');
     const apiUrl = `https://${instance}/api/v1/accounts/lookup?acct=${encodeURIComponent(username)}`;
 
     const response = await axios.get(apiUrl, {
       timeout: 5000,
-      headers: { 'User-Agent': 'SocialAgeChecker/1.0' } // Polite user agent
+      headers: { 'User-Agent': 'SocialAgeChecker/1.0' }
     });
-    return response.data;
+    return { data: response.data, instanceUsed: instance };
   } catch (error) {
     console.error('Mastodon API Error:', {
       status: error.response?.status,
@@ -57,31 +55,33 @@ async function getMastodonProfile(handle) {
 
 // Root endpoint
 app.get('/', (req, res) => {
-  res.send('Mastodon Account Age Checker API is running');
+  res.send(`Mastodon Account Age Checker API is running (default instance: ${defaultInstance})`);
 });
 
 // Mastodon age checker endpoint (GET)
 app.get('/api/mastodon/:handle', async (req, res) => {
   const { handle } = req.params;
   if (!handle) {
-    return res.status(400).json({ error: 'Handle is required (e.g., gargron@mastodon.social)' });
+    return res.status(400).json({ error: 'Handle is required (e.g., gargron or gargron@mastodon.social)' });
   }
 
-  // Basic validation for Mastodon handle (username@instance, 3-30 chars username, valid domain)
-  const handleRegex = /^[a-zA-Z0-9_]{3,30}@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+  // Validate handle: username@instance or username (3-30 chars username, valid domain if provided)
+  const handleRegex = /^[a-zA-Z0-9_]{3,30}(@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})?$/;
   if (!handleRegex.test(handle)) {
-    return res.status(400).json({ error: 'Invalid Mastodon handle format. Use username@instance.social (3-30 chars username, valid domain).' });
+    return res.status(400).json({ 
+      error: `Invalid Mastodon handle format. Use username (3-30 chars, letters/numbers/underscores) or username@instance.social. Default instance: ${defaultInstance}.`
+    });
   }
 
   try {
-    const profile = await getMastodonProfile(handle);
+    const { data: profile, instanceUsed } = await getMastodonProfile(handle);
 
     if (!profile || !profile.id) {
-      return res.status(404).json({ error: `Mastodon account ${handle} not found or suspended` });
+      return res.status(404).json({ error: `Mastodon account ${handle} not found or suspended on instance ${instanceUsed}` });
     }
 
-    // Generate avatar URL if missing (fallback to instance default)
-    const avatarUrl = profile.avatar_static || profile.avatar || `https://${handle.split('@')[1]}/avatars/original/missing.png`;
+    // Generate avatar URL if missing
+    const avatarUrl = profile.avatar_static || profile.avatar || `https://${instanceUsed}/avatars/original/missing.png`;
 
     res.json({
       username: profile.username,
@@ -90,19 +90,21 @@ app.get('/api/mastodon/:handle', async (req, res) => {
       account_age: calculateAccountAge(profile.created_at),
       age_days: calculateAgeDays(profile.created_at),
       followers: profile.followers_count.toString(),
-      total_posts: profile.statuses_count.toString(), // Public toots/posts
+      total_posts: profile.statuses_count.toString(),
       verified: profile.bot ? 'Bot Account' : (profile.locked ? 'Protected' : 'Standard'),
-      description: profile.note.replace(/<[^>]*>/g, ''), // Strip HTML from bio
-      region: 'N/A', // No location field in public API
+      description: profile.note.replace(/<[^>]*>/g, ''),
+      region: 'N/A',
       user_id: profile.id,
       avatar: avatarUrl,
       estimation_confidence: 'High (exact server timestamp)',
       accuracy_range: 'Second-level (ISO 8601 timestamp)',
-      profile_link: profile.url || `https://${handle.split('@')[1]}/@${profile.username}`
+      profile_link: profile.url || `https://${instanceUsed}/@${profile.username}`,
+      instance_used: instanceUsed
     });
   } catch (error) {
     if (error.response?.status === 404 || error.response?.status === 403) {
-      return res.status(404).json({ error: `Mastodon account ${handle} not found, suspended, or instance unavailable` });
+      const instance = handle.includes('@') ? handle.split('@')[1] : defaultInstance;
+      return res.status(404).json({ error: `Mastodon account ${handle} not found, suspended, or instance ${instance} unavailable` });
     }
 
     console.error('Mastodon API Error:', {
