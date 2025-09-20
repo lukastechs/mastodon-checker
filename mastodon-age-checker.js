@@ -5,7 +5,7 @@ require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 3000;
-const defaultInstance = process.env.DEFAULT_INSTANCE || 'mastodon.social';
+const instances = process.env.MASTODON_INSTANCES ? process.env.MASTODON_INSTANCES.split(',') : ['mastodon.social', 'fosstodon.org', 'mstdn.social'];
 
 app.use(cors());
 app.use(express.json());
@@ -29,33 +29,69 @@ function calculateAgeDays(createdAt) {
   return Math.floor(diffMs / (1000 * 60 * 60 * 24));
 }
 
-// Fetch Mastodon user profile by handle (username or username@instance)
-async function getMastodonProfile(handle) {
-  try {
-    // If no @instance, append default instance (e.g., mastodon.social)
-    let fullHandle = handle.includes('@') ? handle : `${handle}@${defaultInstance}`;
-    const [username, instance] = fullHandle.split('@');
-    const apiUrl = `https://${instance}/api/v1/accounts/lookup?acct=${encodeURIComponent(username)}`;
+// Process profile data into response format
+function processProfileData(profile, instanceUsed) {
+  const avatarUrl = profile.avatar_static || profile.avatar || `https://${instanceUsed}/avatars/original/missing.png`;
+  return {
+    username: profile.username,
+    nickname: profile.display_name || profile.username,
+    estimated_creation_date: new Date(profile.created_at).toLocaleDateString(),
+    account_age: calculateAccountAge(profile.created_at),
+    age_days: calculateAgeDays(profile.created_at),
+    followers: profile.followers_count.toString(),
+    total_posts: profile.statuses_count.toString(),
+    verified: profile.bot ? 'Bot Account' : (profile.locked ? 'Protected' : 'Standard'),
+    description: profile.note.replace(/<[^>]*>/g, ''),
+    region: 'N/A',
+    user_id: profile.id,
+    avatar: avatarUrl,
+    estimation_confidence: 'High (exact server timestamp)',
+    accuracy_range: 'Second-level (ISO 8601 timestamp)',
+    profile_link: profile.url || `https://${instanceUsed}/@${profile.username}`,
+    instance_used: instanceUsed
+  };
+}
 
+// Fetch Mastodon user profile from a single instance
+async function fetchFromInstance(username, instance) {
+  try {
+    const apiUrl = `https://${instance}/api/v1/accounts/lookup?acct=${encodeURIComponent(username)}`;
     const response = await axios.get(apiUrl, {
       timeout: 5000,
       headers: { 'User-Agent': 'SocialAgeChecker/1.0' }
     });
     return { data: response.data, instanceUsed: instance };
   } catch (error) {
-    console.error('Mastodon API Error:', {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message,
-      url: error.config?.url
-    });
-    throw error;
+    return { error, instanceUsed: instance };
   }
+}
+
+// Fetch Mastodon user profile by handle (username or username@instance)
+async function getMastodonProfile(handle) {
+  const isFullHandle = handle.includes('@');
+  const [username] = handle.split('@');
+
+  if (isFullHandle) {
+    const [, instance] = handle.split('@');
+    return await fetchFromInstance(username, instance);
+  }
+
+  // Try all configured instances for username-only
+  const promises = instances.map(instance => fetchFromInstance(username, instance));
+  const results = await Promise.all(promises);
+  const successes = results.filter(result => result.data && result.data.id);
+  const errors = results.filter(result => result.error);
+
+  if (successes.length === 0) {
+    throw new Error(`No account found for ${username} on instances: ${instances.join(', ')}`);
+  }
+
+  return successes;
 }
 
 // Root endpoint
 app.get('/', (req, res) => {
-  res.send(`Mastodon Account Age Checker API is running (default instance: ${defaultInstance})`);
+  res.send(`Mastodon Account Age Checker API is running (instances: ${instances.join(', ')})`);
 });
 
 // Mastodon age checker endpoint (GET)
@@ -69,52 +105,48 @@ app.get('/api/mastodon/:handle', async (req, res) => {
   const handleRegex = /^[a-zA-Z0-9_]{3,30}(@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})?$/;
   if (!handleRegex.test(handle)) {
     return res.status(400).json({ 
-      error: `Invalid Mastodon handle format. Use username (3-30 chars, letters/numbers/underscores) or username@instance.social. Default instance: ${defaultInstance}.`
+      error: `Invalid Mastodon handle format. Use username (3-30 chars, letters/numbers/underscores) or username@instance.social. Searched instances: ${instances.join(', ')}.`
     });
   }
 
   try {
-    const { data: profile, instanceUsed } = await getMastodonProfile(handle);
+    const result = await getMastodonProfile(handle);
 
-    if (!profile || !profile.id) {
-      return res.status(404).json({ error: `Mastodon account ${handle} not found or suspended on instance ${instanceUsed}` });
+    // Single instance (full handle) or single match
+    if (!Array.isArray(result)) {
+      if (result.error) {
+        const instance = handle.includes('@') ? handle.split('@')[1] : instances[0];
+        return res.status(result.error.response?.status || 404).json({ 
+          error: `Mastodon account ${handle} not found, suspended, or instance ${instance} unavailable`
+        });
+      }
+      const profileData = processProfileData(result.data, result.instanceUsed);
+      return res.json(profileData);
     }
 
-    // Generate avatar URL if missing
-    const avatarUrl = profile.avatar_static || profile.avatar || `https://${instanceUsed}/avatars/original/missing.png`;
+    // Multiple matches across instances
+    if (result.length > 1) {
+      const profiles = result.map(r => ({
+        ...processProfileData(r.data, r.instanceUsed),
+        estimation_confidence: 'Medium (multiple instances found)'
+      }));
+      return res.json({
+        users: profiles,
+        note: `Multiple accounts found for ${handle.split('@')[0]}. Use instance_used or profile_link to select the correct account.`
+      });
+    }
 
-    res.json({
-      username: profile.username,
-      nickname: profile.display_name || profile.username,
-      estimated_creation_date: new Date(profile.created_at).toLocaleDateString(),
-      account_age: calculateAccountAge(profile.created_at),
-      age_days: calculateAgeDays(profile.created_at),
-      followers: profile.followers_count.toString(),
-      total_posts: profile.statuses_count.toString(),
-      verified: profile.bot ? 'Bot Account' : (profile.locked ? 'Protected' : 'Standard'),
-      description: profile.note.replace(/<[^>]*>/g, ''),
-      region: 'N/A',
-      user_id: profile.id,
-      avatar: avatarUrl,
-      estimation_confidence: 'High (exact server timestamp)',
-      accuracy_range: 'Second-level (ISO 8601 timestamp)',
-      profile_link: profile.url || `https://${instanceUsed}/@${profile.username}`,
-      instance_used: instanceUsed
-    });
+    // Single match from multiple instances
+    const profileData = processProfileData(result[0].data, result[0].instanceUsed);
+    res.json(profileData);
   } catch (error) {
-    if (error.response?.status === 404 || error.response?.status === 403) {
-      const instance = handle.includes('@') ? handle.split('@')[1] : defaultInstance;
-      return res.status(404).json({ error: `Mastodon account ${handle} not found, suspended, or instance ${instance} unavailable` });
-    }
-
     console.error('Mastodon API Error:', {
-      status: error.response?.status,
-      data: error.response?.data,
-      message: error.message
+      message: error.message,
+      instances: instances.join(', ')
     });
-    res.status(error.response?.status || 500).json({
+    res.status(500).json({
       error: error.message || 'Failed to fetch Mastodon data',
-      details: error.response?.data || 'No additional details'
+      details: `Searched instances: ${instances.join(', ')}`
     });
   }
 });
